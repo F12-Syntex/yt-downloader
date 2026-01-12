@@ -4,12 +4,10 @@ import { select, input, checkbox, confirm } from '@inquirer/prompts';
 import chalk from 'chalk';
 import ora from 'ora';
 import cliProgress from 'cli-progress';
-import ytdl from '@distube/ytdl-core';
-import ytpl from '@distube/ytpl';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -54,164 +52,253 @@ function formatBytes(bytes) {
   return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${sizes[i]}`;
 }
 
-// Check if ffmpeg is available
-async function checkFfmpeg() {
+// Check if yt-dlp is available
+async function checkYtDlp() {
   return new Promise((resolve) => {
-    const process = spawn('ffmpeg', ['-version'], { shell: true });
-    process.on('close', (code) => resolve(code === 0));
-    process.on('error', () => resolve(false));
+    try {
+      execSync('yt-dlp --version', { stdio: 'pipe' });
+      resolve(true);
+    } catch {
+      resolve(false);
+    }
   });
 }
 
-// Get video info
+// Get video info using yt-dlp
 async function getVideoInfo(url) {
   const spinner = ora('Fetching video information...').start();
-  try {
-    const info = await ytdl.getInfo(url);
-    spinner.succeed('Video information fetched!');
-    return info;
-  } catch (error) {
-    spinner.fail('Failed to fetch video information');
-    throw error;
-  }
+  return new Promise((resolve, reject) => {
+    const args = [
+      '--dump-json',
+      '--no-playlist',
+      url
+    ];
+
+    const process = spawn('yt-dlp', args, { shell: true });
+    let output = '';
+    let errorOutput = '';
+
+    process.stdout.on('data', (data) => {
+      output += data.toString();
+    });
+
+    process.stderr.on('data', (data) => {
+      errorOutput += data.toString();
+    });
+
+    process.on('close', (code) => {
+      if (code === 0 && output) {
+        try {
+          const info = JSON.parse(output);
+          spinner.succeed('Video information fetched!');
+          resolve(info);
+        } catch (e) {
+          spinner.fail('Failed to parse video information');
+          reject(new Error('Failed to parse video info'));
+        }
+      } else {
+        spinner.fail('Failed to fetch video information');
+        reject(new Error(errorOutput || 'Failed to fetch video info'));
+      }
+    });
+
+    process.on('error', (err) => {
+      spinner.fail('Failed to run yt-dlp');
+      reject(err);
+    });
+  });
 }
 
-// Get playlist info
+// Get playlist info using yt-dlp
 async function getPlaylistInfo(url) {
   const spinner = ora('Fetching playlist information...').start();
-  try {
-    const playlist = await ytpl(url, { limit: Infinity });
-    spinner.succeed(`Playlist fetched: ${playlist.items.length} videos found!`);
-    return playlist;
-  } catch (error) {
-    spinner.fail('Failed to fetch playlist information');
-    throw error;
-  }
+  return new Promise((resolve, reject) => {
+    const args = [
+      '--flat-playlist',
+      '--dump-json',
+      url
+    ];
+
+    const process = spawn('yt-dlp', args, { shell: true });
+    let output = '';
+    let errorOutput = '';
+
+    process.stdout.on('data', (data) => {
+      output += data.toString();
+    });
+
+    process.stderr.on('data', (data) => {
+      errorOutput += data.toString();
+    });
+
+    process.on('close', (code) => {
+      if (code === 0 && output) {
+        try {
+          const lines = output.trim().split('\n');
+          const items = lines.map(line => JSON.parse(line));
+
+          // First item might be playlist metadata
+          let playlistTitle = 'Playlist';
+          let playlistAuthor = 'Unknown';
+          let videos = [];
+
+          for (const item of items) {
+            if (item._type === 'playlist' || item.title && !item.url) {
+              playlistTitle = item.title || playlistTitle;
+              playlistAuthor = item.uploader || item.channel || playlistAuthor;
+            } else {
+              videos.push({
+                title: item.title || 'Untitled',
+                url: item.url || `https://www.youtube.com/watch?v=${item.id}`,
+                duration: item.duration,
+                id: item.id
+              });
+            }
+          }
+
+          // If no playlist metadata found, try to extract from first video's playlist info
+          if (videos.length > 0 && items[0]) {
+            playlistTitle = items[0].playlist_title || items[0].playlist || playlistTitle;
+          }
+
+          spinner.succeed(`Playlist fetched: ${videos.length} videos found!`);
+          resolve({
+            title: playlistTitle,
+            author: playlistAuthor,
+            items: videos
+          });
+        } catch (e) {
+          spinner.fail('Failed to parse playlist information');
+          reject(new Error('Failed to parse playlist info: ' + e.message));
+        }
+      } else {
+        spinner.fail('Failed to fetch playlist information');
+        reject(new Error(errorOutput || 'Failed to fetch playlist info'));
+      }
+    });
+
+    process.on('error', (err) => {
+      spinner.fail('Failed to run yt-dlp');
+      reject(err);
+    });
+  });
 }
 
-// Get available formats
-function getAvailableFormats(info, type) {
-  const formats = info.formats;
-
-  if (type === 'audio') {
-    return formats
-      .filter(f => f.hasAudio && !f.hasVideo)
-      .sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0));
-  } else if (type === 'video') {
-    return formats
-      .filter(f => f.hasVideo)
-      .sort((a, b) => {
-        const aHeight = parseInt(a.height) || 0;
-        const bHeight = parseInt(b.height) || 0;
-        return bHeight - aHeight;
-      });
-  } else {
-    // Both audio and video
-    return formats
-      .filter(f => f.hasVideo && f.hasAudio)
-      .sort((a, b) => {
-        const aHeight = parseInt(a.height) || 0;
-        const bHeight = parseInt(b.height) || 0;
-        return bHeight - aHeight;
-      });
-  }
-}
-
-// Download single video
+// Download single video using yt-dlp
 async function downloadVideo(url, options = {}) {
   const { format = 'both', quality = 'highest', outputPath = downloadDir } = options;
 
   ensureDownloadDir();
+  const targetDir = outputPath || downloadDir;
+
+  if (!fs.existsSync(targetDir)) {
+    fs.mkdirSync(targetDir, { recursive: true });
+  }
 
   try {
+    // First get video info
     const info = await getVideoInfo(url);
-    const title = sanitizeFilename(info.videoDetails.title);
+    const videoTitle = info.title || 'Untitled Video';
 
     console.log(chalk.cyan('\n📹 Video Details:'));
-    console.log(chalk.white(`   Title: ${info.videoDetails.title}`));
-    console.log(chalk.white(`   Channel: ${info.videoDetails.author.name}`));
-    console.log(chalk.white(`   Duration: ${formatDuration(parseInt(info.videoDetails.lengthSeconds))}`));
-    console.log(chalk.white(`   Views: ${parseInt(info.videoDetails.viewCount).toLocaleString()}`));
+    console.log(chalk.white(`   Title: ${videoTitle}`));
+    console.log(chalk.white(`   Channel: ${info.uploader || info.channel || 'Unknown'}`));
+    console.log(chalk.white(`   Duration: ${formatDuration(info.duration || 0)}`));
+    console.log(chalk.white(`   Views: ${(info.view_count || 0).toLocaleString()}`));
 
-    let selectedFormat;
-    const availableFormats = getAvailableFormats(info, format);
+    // Build yt-dlp arguments
+    const args = [
+      '--no-playlist',
+      '-o', path.join(targetDir, '%(title)s.%(ext)s'),
+      '--progress',
+      '--newline'
+    ];
 
-    if (availableFormats.length === 0) {
-      console.log(chalk.yellow('\nNo formats available for selected type. Using best available...'));
-      selectedFormat = ytdl.chooseFormat(info.formats, { quality: 'highest' });
-    } else if (quality === 'select') {
-      // Let user select quality
-      const formatChoices = availableFormats.slice(0, 10).map(f => ({
-        name: `${f.qualityLabel || f.audioQuality || 'Unknown'} - ${f.container} ${f.hasVideo ? '(video)' : ''} ${f.hasAudio ? '(audio)' : ''} - ${formatBytes(f.contentLength)}`,
-        value: f
-      }));
-
-      selectedFormat = await select({
-        message: 'Select quality:',
-        choices: formatChoices
-      });
+    // Format selection
+    if (format === 'audio') {
+      args.push('-x');  // Extract audio
+      args.push('--audio-format', 'mp3');
+      args.push('--audio-quality', '0');  // Best quality
+    } else if (format === 'video') {
+      args.push('-f', 'bestvideo[ext=mp4]/bestvideo');
     } else {
-      selectedFormat = availableFormats[0];
+      // Both audio and video
+      if (quality === 'highest') {
+        args.push('-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best');
+      } else if (quality === 'lowest') {
+        args.push('-f', 'worstvideo[ext=mp4]+worstaudio[ext=m4a]/worst[ext=mp4]/worst');
+      } else {
+        args.push('-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best');
+      }
     }
 
-    const extension = format === 'audio' ? 'mp3' : selectedFormat.container || 'mp4';
-    const filename = `${title}.${extension}`;
-    const filepath = path.join(outputPath, filename);
+    args.push(url);
 
-    console.log(chalk.green(`\n⬇️  Downloading: ${filename}`));
+    console.log(chalk.green(`\n⬇️  Downloading: ${videoTitle}`));
 
     // Create progress bar
     const progressBar = new cliProgress.SingleBar({
-      format: chalk.cyan('{bar}') + ' | {percentage}% | {downloaded}/{total}',
+      format: chalk.cyan('{bar}') + ' | {percentage}% | {speed}',
       barCompleteChar: '█',
       barIncompleteChar: '░',
       hideCursor: true
     });
 
+    let progressStarted = false;
+
     return new Promise((resolve, reject) => {
-      const stream = ytdl(url, { format: selectedFormat });
-      const writeStream = fs.createWriteStream(filepath);
+      const process = spawn('yt-dlp', args, { shell: true });
 
-      let totalSize = parseInt(selectedFormat.contentLength) || 0;
-      let downloaded = 0;
-      let started = false;
+      process.stdout.on('data', (data) => {
+        const line = data.toString();
 
-      stream.on('response', (res) => {
-        totalSize = parseInt(res.headers['content-length']) || totalSize;
-        if (totalSize > 0) {
-          progressBar.start(totalSize, 0, {
-            downloaded: formatBytes(0),
-            total: formatBytes(totalSize)
-          });
-          started = true;
+        // Parse progress from yt-dlp output
+        const progressMatch = line.match(/(\d+\.?\d*)%/);
+        const speedMatch = line.match(/at\s+([^\s]+)/);
+
+        if (progressMatch) {
+          const percent = parseFloat(progressMatch[1]);
+          const speed = speedMatch ? speedMatch[1] : 'N/A';
+
+          if (!progressStarted) {
+            progressBar.start(100, 0, { speed: 'Starting...' });
+            progressStarted = true;
+          }
+          progressBar.update(percent, { speed: speed });
         }
       });
 
-      stream.on('data', (chunk) => {
-        downloaded += chunk.length;
-        if (started) {
-          progressBar.update(downloaded, {
-            downloaded: formatBytes(downloaded),
-            total: formatBytes(totalSize)
-          });
+      process.stderr.on('data', (data) => {
+        // yt-dlp outputs progress to stderr sometimes
+        const line = data.toString();
+        const progressMatch = line.match(/(\d+\.?\d*)%/);
+        const speedMatch = line.match(/at\s+([^\s]+)/);
+
+        if (progressMatch) {
+          const percent = parseFloat(progressMatch[1]);
+          const speed = speedMatch ? speedMatch[1] : 'N/A';
+
+          if (!progressStarted) {
+            progressBar.start(100, 0, { speed: 'Starting...' });
+            progressStarted = true;
+          }
+          progressBar.update(percent, { speed: speed });
         }
       });
 
-      stream.pipe(writeStream);
+      process.on('close', (code) => {
+        if (progressStarted) progressBar.stop();
 
-      writeStream.on('finish', () => {
-        if (started) progressBar.stop();
-        console.log(chalk.green(`\n✅ Downloaded successfully: ${filepath}`));
-        resolve(filepath);
+        if (code === 0) {
+          console.log(chalk.green(`✅ Downloaded successfully to: ${targetDir}`));
+          resolve(targetDir);
+        } else {
+          reject(new Error(`Download failed with code ${code}`));
+        }
       });
 
-      stream.on('error', (err) => {
-        if (started) progressBar.stop();
-        reject(err);
-      });
-
-      writeStream.on('error', (err) => {
-        if (started) progressBar.stop();
+      process.on('error', (err) => {
+        if (progressStarted) progressBar.stop();
         reject(err);
       });
     });
@@ -230,14 +317,15 @@ async function downloadPlaylist(url, options = {}) {
 
     console.log(chalk.cyan('\n📋 Playlist Details:'));
     console.log(chalk.white(`   Title: ${playlist.title}`));
-    console.log(chalk.white(`   Channel: ${playlist.author?.name || 'Unknown'}`));
+    console.log(chalk.white(`   Channel: ${playlist.author}`));
     console.log(chalk.white(`   Total Videos: ${playlist.items.length}`));
 
     // Show all videos
     console.log(chalk.yellow('\n📹 Videos in playlist:\n'));
     playlist.items.forEach((item, index) => {
-      const duration = formatDuration(item.durationSec);
-      console.log(chalk.white(`   ${(index + 1).toString().padStart(3)}. ${item.title.substring(0, 60)}${item.title.length > 60 ? '...' : ''} [${duration}]`));
+      const duration = formatDuration(item.duration);
+      const title = item.title || 'Untitled';
+      console.log(chalk.white(`   ${(index + 1).toString().padStart(3)}. ${title.substring(0, 60)}${title.length > 60 ? '...' : ''} [${duration}]`));
     });
 
     // Let user select videos
@@ -258,11 +346,14 @@ async function downloadPlaylist(url, options = {}) {
     } else if (selectOption === 'all') {
       selectedVideos = playlist.items;
     } else if (selectOption === 'select') {
-      const choices = playlist.items.map((item, index) => ({
-        name: `${(index + 1).toString().padStart(3)}. ${item.title.substring(0, 50)} [${formatDuration(item.durationSec)}]`,
-        value: item,
-        checked: false
-      }));
+      const choices = playlist.items.map((item, index) => {
+        const title = item.title || 'Untitled';
+        return {
+          name: `${(index + 1).toString().padStart(3)}. ${title.substring(0, 50)} [${formatDuration(item.duration)}]`,
+          value: item,
+          checked: false
+        };
+      });
 
       selectedVideos = await checkbox({
         message: 'Select videos to download (space to select, enter to confirm):',
@@ -315,10 +406,10 @@ async function downloadPlaylist(url, options = {}) {
 
     for (let i = 0; i < selectedVideos.length; i++) {
       const video = selectedVideos[i];
-      console.log(chalk.cyan(`\n[${i + 1}/${selectedVideos.length}] ${video.title}`));
+      console.log(chalk.cyan(`\n[${i + 1}/${selectedVideos.length}] ${video.title || 'Untitled'}`));
 
       try {
-        await downloadVideo(video.url, {
+        await downloadVideoSimple(video.url, {
           format,
           quality,
           outputPath: playlistFolder
@@ -342,6 +433,108 @@ async function downloadPlaylist(url, options = {}) {
   }
 }
 
+// Simple download without fetching info first (for playlist items)
+async function downloadVideoSimple(url, options = {}) {
+  const { format = 'both', quality = 'highest', outputPath = downloadDir } = options;
+
+  const targetDir = outputPath || downloadDir;
+
+  if (!fs.existsSync(targetDir)) {
+    fs.mkdirSync(targetDir, { recursive: true });
+  }
+
+  // Build yt-dlp arguments
+  const args = [
+    '--no-playlist',
+    '-o', path.join(targetDir, '%(title)s.%(ext)s'),
+    '--progress',
+    '--newline'
+  ];
+
+  // Format selection
+  if (format === 'audio') {
+    args.push('-x');
+    args.push('--audio-format', 'mp3');
+    args.push('--audio-quality', '0');
+  } else if (format === 'video') {
+    args.push('-f', 'bestvideo[ext=mp4]/bestvideo');
+  } else {
+    if (quality === 'highest') {
+      args.push('-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best');
+    } else if (quality === 'lowest') {
+      args.push('-f', 'worstvideo[ext=mp4]+worstaudio[ext=m4a]/worst[ext=mp4]/worst');
+    } else {
+      args.push('-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best');
+    }
+  }
+
+  args.push(url);
+
+  // Create progress bar
+  const progressBar = new cliProgress.SingleBar({
+    format: chalk.cyan('{bar}') + ' | {percentage}% | {speed}',
+    barCompleteChar: '█',
+    barIncompleteChar: '░',
+    hideCursor: true
+  });
+
+  let progressStarted = false;
+
+  return new Promise((resolve, reject) => {
+    const process = spawn('yt-dlp', args, { shell: true });
+
+    process.stdout.on('data', (data) => {
+      const line = data.toString();
+      const progressMatch = line.match(/(\d+\.?\d*)%/);
+      const speedMatch = line.match(/at\s+([^\s]+)/);
+
+      if (progressMatch) {
+        const percent = parseFloat(progressMatch[1]);
+        const speed = speedMatch ? speedMatch[1] : 'N/A';
+
+        if (!progressStarted) {
+          progressBar.start(100, 0, { speed: 'Starting...' });
+          progressStarted = true;
+        }
+        progressBar.update(percent, { speed: speed });
+      }
+    });
+
+    process.stderr.on('data', (data) => {
+      const line = data.toString();
+      const progressMatch = line.match(/(\d+\.?\d*)%/);
+      const speedMatch = line.match(/at\s+([^\s]+)/);
+
+      if (progressMatch) {
+        const percent = parseFloat(progressMatch[1]);
+        const speed = speedMatch ? speedMatch[1] : 'N/A';
+
+        if (!progressStarted) {
+          progressBar.start(100, 0, { speed: 'Starting...' });
+          progressStarted = true;
+        }
+        progressBar.update(percent, { speed: speed });
+      }
+    });
+
+    process.on('close', (code) => {
+      if (progressStarted) progressBar.stop();
+
+      if (code === 0) {
+        console.log(chalk.green(`   ✅ Downloaded successfully!`));
+        resolve(targetDir);
+      } else {
+        reject(new Error(`Download failed with code ${code}`));
+      }
+    });
+
+    process.on('error', (err) => {
+      if (progressStarted) progressBar.stop();
+      reject(err);
+    });
+  });
+}
+
 // Format selection menu
 async function selectFormat() {
   return await select({
@@ -360,7 +553,6 @@ async function selectQuality() {
     message: 'Select quality preference:',
     choices: [
       { name: '⭐ Highest available', value: 'highest' },
-      { name: '📊 Let me choose', value: 'select' },
       { name: '💾 Lowest (save space)', value: 'lowest' }
     ]
   });
@@ -376,6 +568,7 @@ async function settingsMenu() {
       message: 'Settings:',
       choices: [
         { name: '📁 Change download directory', value: 'directory' },
+        { name: '🔄 Update yt-dlp', value: 'update' },
         { name: '🔙 Back to main menu', value: 'back' }
       ]
     });
@@ -393,6 +586,14 @@ async function settingsMenu() {
       });
       downloadDir = path.resolve(newDir);
       console.log(chalk.green(`✅ Download directory updated to: ${downloadDir}`));
+    } else if (choice === 'update') {
+      const spinner = ora('Updating yt-dlp...').start();
+      try {
+        execSync('yt-dlp -U', { stdio: 'pipe' });
+        spinner.succeed('yt-dlp updated successfully!');
+      } catch (error) {
+        spinner.fail('Failed to update yt-dlp. Try running: pip install -U yt-dlp');
+      }
     }
   }
 }
@@ -402,11 +603,20 @@ async function mainMenu() {
   console.clear();
   console.log(banner);
 
-  // Check ffmpeg
-  const hasFfmpeg = await checkFfmpeg();
-  if (!hasFfmpeg) {
-    console.log(chalk.yellow('⚠️  FFmpeg not found. Some features may be limited.\n'));
+  // Check yt-dlp
+  const hasYtDlp = await checkYtDlp();
+  if (!hasYtDlp) {
+    console.log(chalk.red('❌ yt-dlp is not installed!'));
+    console.log(chalk.yellow('\nPlease install yt-dlp first:'));
+    console.log(chalk.white('  Windows: winget install yt-dlp'));
+    console.log(chalk.white('  Or: pip install yt-dlp'));
+    console.log(chalk.white('  Or: choco install yt-dlp'));
+    console.log(chalk.white('\nMac: brew install yt-dlp'));
+    console.log(chalk.white('Linux: pip install yt-dlp\n'));
+    process.exit(1);
   }
+
+  console.log(chalk.green('✓ yt-dlp found\n'));
 
   while (true) {
     const choice = await select({
@@ -517,4 +727,4 @@ async function handleArgs() {
 }
 
 // Start the application
-handleArgs().catch(co
+handleArgs().catch(console.error);
