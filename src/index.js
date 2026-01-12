@@ -30,8 +30,22 @@ function ensureDownloadDir() {
   }
 }
 
-function sanitizeFilename(filename) {
-  return filename.replace(/[<>:"/\\|?*]/g, '_').substring(0, 200);
+function sanitizeFilename(filename, asciiOnly = false) {
+  let result = filename
+    .replace(/[<>:"/\\|?*]/g, '_')
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, ''); // Remove control characters
+
+  if (asciiOnly) {
+    // Remove non-ASCII characters for safer folder names
+    result = result.replace(/[^\x00-\x7F]/g, '');
+  }
+
+  return result
+    .replace(/\s+/g, '_') // Replace spaces with underscores
+    .replace(/_+/g, '_') // Collapse multiple underscores
+    .replace(/^_|_$/g, '') // Remove leading/trailing underscores
+    .trim()
+    .substring(0, 150) || 'download';
 }
 
 function formatDuration(seconds) {
@@ -62,6 +76,16 @@ async function checkYtDlp() {
       resolve(false);
     }
   });
+}
+
+// Check if ffmpeg is available
+function checkFfmpeg() {
+  try {
+    execSync('ffmpeg -version', { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Get video info using yt-dlp
@@ -143,13 +167,14 @@ async function getPlaylistInfo(url) {
           let videos = [];
 
           for (const item of items) {
-            if (item._type === 'playlist' || item.title && !item.url) {
+            if (item._type === 'playlist') {
               playlistTitle = item.title || playlistTitle;
               playlistAuthor = item.uploader || item.channel || playlistAuthor;
-            } else {
+            } else if (item.id) {
+              // Always construct full YouTube URL from video ID
               videos.push({
                 title: item.title || 'Untitled',
-                url: item.url || `https://www.youtube.com/watch?v=${item.id}`,
+                url: `https://www.youtube.com/watch?v=${item.id}`,
                 duration: item.duration,
                 id: item.id
               });
@@ -206,10 +231,12 @@ async function downloadVideo(url, options = {}) {
     console.log(chalk.white(`   Duration: ${formatDuration(info.duration || 0)}`));
     console.log(chalk.white(`   Views: ${(info.view_count || 0).toLocaleString()}`));
 
-    // Build yt-dlp arguments
+    // Build yt-dlp arguments - use restricted filenames for Windows compatibility
+    const outputTemplate = path.join(targetDir, '%(title).150s.%(ext)s');
     const args = [
       '--no-playlist',
-      '-o', path.join(targetDir, '%(title)s.%(ext)s'),
+      '-o', `"${outputTemplate}"`,
+      '--restrict-filenames',
       '--progress',
       '--newline'
     ];
@@ -393,8 +420,8 @@ async function downloadPlaylist(url, options = {}) {
       return;
     }
 
-    // Create playlist folder
-    const playlistFolder = path.join(downloadDir, sanitizeFilename(playlist.title));
+    // Create playlist folder with ASCII-safe name
+    const playlistFolder = path.join(downloadDir, sanitizeFilename(playlist.title, true));
     if (!fs.existsSync(playlistFolder)) {
       fs.mkdirSync(playlistFolder, { recursive: true });
     }
@@ -443,12 +470,15 @@ async function downloadVideoSimple(url, options = {}) {
     fs.mkdirSync(targetDir, { recursive: true });
   }
 
-  // Build yt-dlp arguments
+  // Build yt-dlp arguments - use restricted filenames for Windows compatibility
+  const outputTemplate = path.join(targetDir, '%(title).150s.%(ext)s');
   const args = [
     '--no-playlist',
-    '-o', path.join(targetDir, '%(title)s.%(ext)s'),
+    '-o', `"${outputTemplate}"`,
+    '--restrict-filenames',
     '--progress',
-    '--newline'
+    '--newline',
+    '--no-warnings'
   ];
 
   // Format selection
@@ -479,11 +509,12 @@ async function downloadVideoSimple(url, options = {}) {
   });
 
   let progressStarted = false;
+  let errorOutput = '';
 
   return new Promise((resolve, reject) => {
-    const process = spawn('yt-dlp', args, { shell: true });
+    const proc = spawn('yt-dlp', args, { shell: true });
 
-    process.stdout.on('data', (data) => {
+    proc.stdout.on('data', (data) => {
       const line = data.toString();
       const progressMatch = line.match(/(\d+\.?\d*)%/);
       const speedMatch = line.match(/at\s+([^\s]+)/);
@@ -500,8 +531,10 @@ async function downloadVideoSimple(url, options = {}) {
       }
     });
 
-    process.stderr.on('data', (data) => {
+    proc.stderr.on('data', (data) => {
       const line = data.toString();
+      errorOutput += line;
+
       const progressMatch = line.match(/(\d+\.?\d*)%/);
       const speedMatch = line.match(/at\s+([^\s]+)/);
 
@@ -517,18 +550,21 @@ async function downloadVideoSimple(url, options = {}) {
       }
     });
 
-    process.on('close', (code) => {
+    proc.on('close', (code) => {
       if (progressStarted) progressBar.stop();
 
       if (code === 0) {
         console.log(chalk.green(`   ✅ Downloaded successfully!`));
         resolve(targetDir);
       } else {
-        reject(new Error(`Download failed with code ${code}`));
+        // Extract meaningful error from output
+        const errorMatch = errorOutput.match(/ERROR:\s*(.+)/i);
+        const errorMsg = errorMatch ? errorMatch[1].trim() : `Download failed with code ${code}`;
+        reject(new Error(errorMsg));
       }
     });
 
-    process.on('error', (err) => {
+    proc.on('error', (err) => {
       if (progressStarted) progressBar.stop();
       reject(err);
     });
@@ -616,7 +652,15 @@ async function mainMenu() {
     process.exit(1);
   }
 
-  console.log(chalk.green('✓ yt-dlp found\n'));
+  console.log(chalk.green('✓ yt-dlp found'));
+
+  const hasFfmpeg = checkFfmpeg();
+  if (hasFfmpeg) {
+    console.log(chalk.green('✓ ffmpeg found\n'));
+  } else {
+    console.log(chalk.yellow('⚠ ffmpeg not found - MP3 conversion may not work'));
+    console.log(chalk.gray('  Install: winget install ffmpeg  |  choco install ffmpeg\n'));
+  }
 
   while (true) {
     const choice = await select({
